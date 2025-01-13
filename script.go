@@ -4,10 +4,14 @@ import (
 	"bufio"
 	"container/ring"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
+	"io/fs"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,8 +23,8 @@ import (
 	"sync"
 	"text/template"
 
-	"bitbucket.org/creachadair/shell"
 	"github.com/itchyny/gojq"
+	"mvdan.cc/sh/v3/shell"
 )
 
 // Pipe represents a pipe object with an associated [ReadAutoCloser].
@@ -30,19 +34,16 @@ type Pipe struct {
 	stdout     io.Writer
 	httpClient *http.Client
 
-	// because pipe stages are concurrent, protect 'err'
-	mu  *sync.Mutex
-	err error
+	mu     *sync.Mutex
+	err    error
+	stderr io.Writer
+	env    []string
 }
 
 // Args creates a pipe containing the program's command-line arguments from
 // [os.Args], excluding the program name, one per line.
 func Args() *Pipe {
-	var s strings.Builder
-	for _, a := range os.Args[1:] {
-		s.WriteString(a + "\n")
-	}
-	return Echo(s.String())
+	return Slice(os.Args[1:])
 }
 
 // Do creates a pipe that makes the HTTP request req and produces the response.
@@ -68,17 +69,17 @@ func Exec(cmdLine string) *Pipe {
 
 // File creates a pipe that reads from the file path.
 func File(path string) *Pipe {
-	p := NewPipe()
 	f, err := os.Open(path)
 	if err != nil {
-		return p.WithError(err)
+		return NewPipe().WithError(err)
 	}
-	return p.WithReader(f)
+	return NewPipe().WithReader(f)
 }
 
-// FindFiles creates a pipe listing all the files in the directory path and its
-// subdirectories recursively, one per line, like Unix find(1). If path doesn't
-// exist or can't be read, the pipe's error status will be set.
+// FindFiles creates a pipe listing all the files in the directory dir and its
+// subdirectories recursively, one per line, like Unix find(1).
+// Errors are ignored unless no files are found (in which case the pipe's error
+// status will be set to the last error encountered).
 //
 // Each line of the output consists of a slash-separated path, starting with
 // the initial directory. For example, if the directory looks like this:
@@ -91,27 +92,29 @@ func File(path string) *Pipe {
 //
 //	test/1.txt
 //	test/2.txt
-func FindFiles(path string) *Pipe {
-	var fileNames []string
-	walkFn := func(path string, info os.FileInfo, err error) error {
+func FindFiles(dir string) *Pipe {
+	var paths []string
+	var innerErr error
+	fs.WalkDir(os.DirFS(dir), ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return err
+			innerErr = err
+			return fs.SkipDir
 		}
-		if !info.IsDir() {
-			fileNames = append(fileNames, path)
+		if !d.IsDir() {
+			paths = append(paths, filepath.Join(dir, path))
 		}
 		return nil
+	})
+	if innerErr != nil && len(paths) == 0 {
+		return NewPipe().WithError(innerErr)
 	}
-	if err := filepath.Walk(path, walkFn); err != nil {
-		return NewPipe().WithError(err)
-	}
-	return Slice(fileNames)
+	return Slice(paths)
 }
 
-// Get creates a pipe that makes an HTTP GET request to URL, and produces the
+// Get creates a pipe that makes an HTTP GET request to url, and produces the
 // response. See [Pipe.Do] for how the HTTP response status is interpreted.
-func Get(URL string) *Pipe {
-	return NewPipe().Get(URL)
+func Get(url string) *Pipe {
+	return NewPipe().Get(url)
 }
 
 // IfExists tests whether path exists, and creates a pipe whose error status
@@ -121,12 +124,11 @@ func Get(URL string) *Pipe {
 //
 //	IfExists("/foo/bar").Exec("/usr/bin/something")
 func IfExists(path string) *Pipe {
-	p := NewPipe()
 	_, err := os.Stat(path)
 	if err != nil {
-		return p.WithError(err)
+		return NewPipe().WithError(err)
 	}
-	return p
+	return NewPipe()
 }
 
 // ListFiles creates a pipe containing the files or directories specified by
@@ -144,7 +146,7 @@ func ListFiles(path string) *Pipe {
 		}
 		return Slice(fileNames)
 	}
-	files, err := os.ReadDir(path)
+	entries, err := os.ReadDir(path)
 	if err != nil {
 		// Check for the case where the path matches exactly one file
 		s, err := os.Stat(path)
@@ -156,11 +158,11 @@ func ListFiles(path string) *Pipe {
 		}
 		return NewPipe().WithError(err)
 	}
-	fileNames := make([]string, len(files))
-	for i, f := range files {
-		fileNames[i] = filepath.Join(path, f.Name())
+	matches := make([]string, len(entries))
+	for i, e := range entries {
+		matches[i] = filepath.Join(path, e.Name())
 	}
-	return Slice(fileNames)
+	return Slice(matches)
 }
 
 // NewPipe creates a new pipe with an empty reader (use [Pipe.WithReader] to
@@ -168,22 +170,26 @@ func ListFiles(path string) *Pipe {
 func NewPipe() *Pipe {
 	return &Pipe{
 		Reader:     ReadAutoCloser{},
-		mu:         &sync.Mutex{},
-		err:        nil,
+		mu:         new(sync.Mutex),
 		stdout:     os.Stdout,
 		httpClient: http.DefaultClient,
+		env:        nil,
 	}
 }
 
-// Post creates a pipe that makes an HTTP POST request to URL, with an empty
+// Post creates a pipe that makes an HTTP POST request to url, with an empty
 // body, and produces the response. See [Pipe.Do] for how the HTTP response
 // status is interpreted.
-func Post(URL string) *Pipe {
-	return NewPipe().Post(URL)
+func Post(url string) *Pipe {
+	return NewPipe().Post(url)
 }
 
-// Slice creates a pipe containing each element of s, one per line.
+// Slice creates a pipe containing each element of s, one per line. If s is
+// empty or nil, then the pipe is empty.
 func Slice(s []string) *Pipe {
+	if len(s) == 0 {
+		return NewPipe()
+	}
 	return Echo(strings.Join(s, "\n") + "\n")
 }
 
@@ -198,8 +204,6 @@ func Stdin() *Pipe {
 func (p *Pipe) AppendFile(path string) (int64, error) {
 	return p.writeOrAppendFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY)
 }
-
-var exitStatusPattern = regexp.MustCompile(`exit status (\d+)$`)
 
 // Basename reads paths from the pipe, one per line, and removes any leading
 // directory components from each. So, for example, /usr/local/bin/foo would
@@ -268,21 +272,31 @@ func (p *Pipe) Concat() *Pipe {
 	var readers []io.Reader
 	p.FilterScan(func(line string, w io.Writer) {
 		input, err := os.Open(line)
-		if err != nil {
-			return // skip errors
+		if err == nil {
+			readers = append(readers, NewReadAutoCloser(input))
 		}
-		readers = append(readers, NewReadAutoCloser(input))
 	}).Wait()
 	return p.WithReader(io.MultiReader(readers...))
 }
 
 // CountLines returns the number of lines of input, or an error.
-func (p *Pipe) CountLines() (int, error) {
-	lines := 0
+func (p *Pipe) CountLines() (lines int, err error) {
 	p.FilterScan(func(line string, w io.Writer) {
 		lines++
 	}).Wait()
 	return lines, p.Error()
+}
+
+// DecodeBase64 produces the string represented by the base64 encoded input.
+func (p *Pipe) DecodeBase64() *Pipe {
+	return p.Filter(func(r io.Reader, w io.Writer) error {
+		decoder := base64.NewDecoder(base64.StdEncoding, r)
+		_, err := io.Copy(w, decoder)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 // Dirname reads paths from the pipe, one per line, and produces only the
@@ -319,13 +333,13 @@ func (p *Pipe) Do(req *http.Request) *Pipe {
 			return err
 		}
 		defer resp.Body.Close()
-		// Any HTTP 2xx status code is considered okay
-		if resp.StatusCode/100 != 2 {
-			return fmt.Errorf("unexpected HTTP response status: %s", resp.Status)
-		}
 		_, err = io.Copy(w, resp.Body)
 		if err != nil {
 			return err
+		}
+		// Any HTTP 2xx status code is considered okay
+		if resp.StatusCode/100 != 2 {
+			return fmt.Errorf("unexpected HTTP response status: %s", resp.Status)
 		}
 		return nil
 	})
@@ -338,10 +352,10 @@ func (p *Pipe) Do(req *http.Request) *Pipe {
 // concurrently and don't do unnecessary reads on the input.
 func (p *Pipe) EachLine(process func(string, *strings.Builder)) *Pipe {
 	return p.Filter(func(r io.Reader, w io.Writer) error {
-		scanner := bufio.NewScanner(r)
-		output := strings.Builder{}
+		scanner := newScanner(r)
+		output := new(strings.Builder)
 		for scanner.Scan() {
-			process(scanner.Text(), &output)
+			process(scanner.Text(), output)
 		}
 		fmt.Fprint(w, output.String())
 		return scanner.Err()
@@ -354,10 +368,32 @@ func (p *Pipe) Echo(s string) *Pipe {
 	if p.Error() != nil {
 		return p
 	}
-	return p.WithReader(NewReadAutoCloser(strings.NewReader(s)))
+	return p.WithReader(strings.NewReader(s))
+}
+
+// EncodeBase64 produces the base64 encoding of the input.
+func (p *Pipe) EncodeBase64() *Pipe {
+	return p.Filter(func(r io.Reader, w io.Writer) error {
+		encoder := base64.NewEncoder(base64.StdEncoding, w)
+		defer encoder.Close()
+		_, err := io.Copy(encoder, r)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func (p *Pipe) environment() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.env
 }
 
 // Error returns any error present on the pipe, or nil otherwise.
+// Error is not a sink and does not wait until the pipe reaches
+// completion. To wait for completion before returning the error,
+// see [Pipe.Wait].
 func (p *Pipe) Error() error {
 	if p.mu == nil { // uninitialised pipe
 		return nil
@@ -368,8 +404,14 @@ func (p *Pipe) Error() error {
 }
 
 // Exec runs cmdLine as an external command, sending it the contents of the
-// pipe as input, and produces the command's combined output. The effect of
-// this is to filter the contents of the pipe through the external command.
+// pipe as input, and produces the command's standard output (see below for
+// error output). The effect of this is to filter the contents of the pipe
+// through the external command.
+//
+// # Environment
+//
+// The command inherits the current process's environment, optionally modified
+// by [Pipe.WithEnv].
 //
 // # Error handling
 //
@@ -380,19 +422,31 @@ func (p *Pipe) Error() error {
 // because [Pipe.String] is a no-op if the pipe's error status is set, if you
 // want output you will need to reset the error status before calling
 // [Pipe.String].
+//
+// If the command writes to its standard error stream, this will also go to the
+// pipe, along with its standard output. However, the standard error text can
+// instead be redirected to a supplied writer, using [Pipe.WithStderr].
 func (p *Pipe) Exec(cmdLine string) *Pipe {
 	return p.Filter(func(r io.Reader, w io.Writer) error {
-		args, ok := shell.Split(cmdLine) // strings.Fields doesn't handle quotes
-		if !ok {
-			return fmt.Errorf("unbalanced quotes or backslashes in [%s]", cmdLine)
+		args, err := shell.Fields(cmdLine, nil)
+		if err != nil {
+			return err
 		}
 		cmd := exec.Command(args[0], args[1:]...)
 		cmd.Stdin = r
 		cmd.Stdout = w
 		cmd.Stderr = w
-		err := cmd.Start()
+		pipeStderr := p.stdErr()
+		if pipeStderr != nil {
+			cmd.Stderr = pipeStderr
+		}
+		pipeEnv := p.environment()
+		if pipeEnv != nil {
+			cmd.Env = pipeEnv
+		}
+		err = cmd.Start()
 		if err != nil {
-			fmt.Fprintln(w, err)
+			fmt.Fprintln(cmd.Stderr, err)
 			return err
 		}
 		return cmd.Wait()
@@ -401,7 +455,8 @@ func (p *Pipe) Exec(cmdLine string) *Pipe {
 
 // ExecForEach renders cmdLine as a Go template for each line of input, running
 // the resulting command, and produces the combined output of all these
-// commands in sequence. See [Pipe.Exec] for error handling details.
+// commands in sequence. See [Pipe.Exec] for details on error handling and
+// environment variables.
 //
 // This is mostly useful for substituting data into commands using Go template
 // syntax. For example:
@@ -413,35 +468,43 @@ func (p *Pipe) ExecForEach(cmdLine string) *Pipe {
 		return p.WithError(err)
 	}
 	return p.Filter(func(r io.Reader, w io.Writer) error {
-		scanner := bufio.NewScanner(r)
+		scanner := newScanner(r)
 		for scanner.Scan() {
-			cmdLine := strings.Builder{}
-			err := tpl.Execute(&cmdLine, scanner.Text())
+			cmdLine := new(strings.Builder)
+			err := tpl.Execute(cmdLine, scanner.Text())
 			if err != nil {
 				return err
 			}
-			// strings.Fields doesn't handle quotes
-			args, ok := shell.Split(cmdLine.String())
-			if !ok {
-				return fmt.Errorf("unbalanced quotes or backslashes in [%s]", cmdLine.String())
+			args, err := shell.Fields(cmdLine.String(), nil)
+			if err != nil {
+				return err
 			}
 			cmd := exec.Command(args[0], args[1:]...)
 			cmd.Stdout = w
 			cmd.Stderr = w
+			pipeStderr := p.stdErr()
+			if pipeStderr != nil {
+				cmd.Stderr = pipeStderr
+			}
+			if p.env != nil {
+				cmd.Env = p.env
+			}
 			err = cmd.Start()
 			if err != nil {
-				fmt.Fprintln(w, err)
+				fmt.Fprintln(cmd.Stderr, err)
 				continue
 			}
 			err = cmd.Wait()
 			if err != nil {
-				fmt.Fprintln(w, err)
+				fmt.Fprintln(cmd.Stderr, err)
 				continue
 			}
 		}
 		return scanner.Err()
 	})
 }
+
+var exitStatusPattern = regexp.MustCompile(`exit status (\d+)$`)
 
 // ExitStatus returns the integer exit status of a previous command (for
 // example run by [Pipe.Exec]). This will be zero unless the pipe's error
@@ -502,7 +565,7 @@ func (p *Pipe) FilterLine(filter func(string) string) *Pipe {
 // handling.
 func (p *Pipe) FilterScan(filter func(string, io.Writer)) *Pipe {
 	return p.Filter(func(r io.Reader, w io.Writer) error {
-		scanner := bufio.NewScanner(r)
+		scanner := newScanner(r)
 		for scanner.Scan() {
 			filter(scanner.Text(), w)
 		}
@@ -512,7 +575,8 @@ func (p *Pipe) FilterScan(filter func(string, io.Writer)) *Pipe {
 
 // First produces only the first n lines of the pipe's contents, or all the
 // lines if there are less than n. If n is zero or negative, there is no output
-// at all.
+// at all. When n lines have been produced, First stops reading its input and
+// sends EOF to its output.
 func (p *Pipe) First(n int) *Pipe {
 	if p.Error() != nil {
 		return p
@@ -520,13 +584,15 @@ func (p *Pipe) First(n int) *Pipe {
 	if n <= 0 {
 		return NewPipe()
 	}
-	i := 0
-	return p.FilterScan(func(line string, w io.Writer) {
-		if i >= n {
-			return
+	return p.Filter(func(r io.Reader, w io.Writer) error {
+		scanner := newScanner(r)
+		for i := 0; i < n && scanner.Scan(); i++ {
+			_, err := fmt.Fprintln(w, scanner.Text())
+			if err != nil {
+				return err
+			}
 		}
-		fmt.Fprintln(w, line)
-		i++
+		return scanner.Err()
 	})
 }
 
@@ -555,16 +621,16 @@ func (p *Pipe) Freq() *Pipe {
 		count int
 	}
 	return p.Filter(func(r io.Reader, w io.Writer) error {
-		scanner := bufio.NewScanner(r)
+		scanner := newScanner(r)
 		for scanner.Scan() {
 			freq[scanner.Text()]++
 		}
 		freqs := make([]frequency, 0, len(freq))
-		var maxCount int
+		max := 0
 		for line, count := range freq {
 			freqs = append(freqs, frequency{line, count})
-			if count > maxCount {
-				maxCount = count
+			if count > max {
+				max = count
 			}
 		}
 		sort.Slice(freqs, func(i, j int) bool {
@@ -574,7 +640,7 @@ func (p *Pipe) Freq() *Pipe {
 			}
 			return x > y
 		})
-		fieldWidth := len(strconv.Itoa(maxCount))
+		fieldWidth := len(strconv.Itoa(max))
 		for _, item := range freqs {
 			fmt.Fprintf(w, "%*d %s\n", fieldWidth, item.count, item.line)
 		}
@@ -582,29 +648,62 @@ func (p *Pipe) Freq() *Pipe {
 	})
 }
 
-// Get makes an HTTP GET request to URL, sending the contents of the pipe as
+// Get makes an HTTP GET request to url, sending the contents of the pipe as
 // the request body, and produces the server's response. See [Pipe.Do] for how
 // the HTTP response status is interpreted.
-func (p *Pipe) Get(URL string) *Pipe {
-	req, err := http.NewRequest(http.MethodGet, URL, p.Reader)
+func (p *Pipe) Get(url string) *Pipe {
+	req, err := http.NewRequest(http.MethodGet, url, p.Reader)
 	if err != nil {
 		return p.WithError(err)
 	}
 	return p.Do(req)
 }
 
+// Hash returns the hex-encoded hash of the entire contents of the
+// pipe based on the provided hasher, or an error.
+// To perform hashing on files, see [Pipe.HashSums].
+func (p *Pipe) Hash(hasher hash.Hash) (string, error) {
+	if p.Error() != nil {
+		return "", p.Error()
+	}
+	_, err := io.Copy(hasher, p)
+	if err != nil {
+		p.SetError(err)
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// HashSums reads paths from the pipe, one per line, and produces the
+// hex-encoded hash of each corresponding file based on the provided hasher,
+// one per line. Any files that cannot be opened or read will be ignored.
+// To perform hashing on the contents of the pipe, see [Pipe.Hash].
+func (p *Pipe) HashSums(hasher hash.Hash) *Pipe {
+	return p.FilterScan(func(line string, w io.Writer) {
+		f, err := os.Open(line)
+		if err != nil {
+			return // skip unopenable files
+		}
+		defer f.Close()
+		_, err = io.Copy(hasher, f)
+		if err != nil {
+			return // skip unreadable files
+		}
+		fmt.Fprintln(w, hex.EncodeToString(hasher.Sum(nil)))
+	})
+}
+
 // Join joins all the lines in the pipe's contents into a single
 // space-separated string, which will always end with a newline.
 func (p *Pipe) Join() *Pipe {
 	return p.Filter(func(r io.Reader, w io.Writer) error {
-		scanner := bufio.NewScanner(r)
-		var line string
+		scanner := newScanner(r)
 		first := true
 		for scanner.Scan() {
 			if !first {
 				fmt.Fprint(w, " ")
 			}
-			line = scanner.Text()
+			line := scanner.Text()
 			fmt.Fprint(w, line)
 			first = false
 		}
@@ -659,7 +758,7 @@ func (p *Pipe) Last(n int) *Pipe {
 		return NewPipe()
 	}
 	return p.Filter(func(r io.Reader, w io.Writer) error {
-		scanner := bufio.NewScanner(r)
+		scanner := newScanner(r)
 		input := ring.New(n)
 		for scanner.Scan() {
 			input.Value = scanner.Text()
@@ -692,25 +791,15 @@ func (p *Pipe) MatchRegexp(re *regexp.Regexp) *Pipe {
 	})
 }
 
-// Post makes an HTTP POST request to URL, using the contents of the pipe as
+// Post makes an HTTP POST request to url, using the contents of the pipe as
 // the request body, and produces the server's response. See [Pipe.Do] for how
 // the HTTP response status is interpreted.
-func (p *Pipe) Post(URL string) *Pipe {
-	req, err := http.NewRequest(http.MethodPost, URL, p.Reader)
+func (p *Pipe) Post(url string) *Pipe {
+	req, err := http.NewRequest(http.MethodPost, url, p.Reader)
 	if err != nil {
 		return p.WithError(err)
 	}
 	return p.Do(req)
-}
-
-// Read reads up to len(b) bytes from the pipe into b. It returns the number of
-// bytes read and any error encountered. At end of file, or on a nil pipe, Read
-// returns 0, [io.EOF].
-func (p *Pipe) Read(b []byte) (int, error) {
-	if p.Error() != nil {
-		return 0, p.Error()
-	}
-	return p.Reader.Read(b)
 }
 
 // Reject produces only lines that do not contain the string s.
@@ -740,12 +829,22 @@ func (p *Pipe) Replace(search, replace string) *Pipe {
 }
 
 // ReplaceRegexp replaces all matches of the compiled regexp re with the string
-// re. $x variables in the replace string are interpreted as by
-// [regexp.Expand]; for example, $1 represents the text of the first submatch.
+// replace. $x variables in the replace string are interpreted as by
+// [regexp#Regexp.Expand]; for example, $1 represents the text of the first submatch.
 func (p *Pipe) ReplaceRegexp(re *regexp.Regexp, replace string) *Pipe {
 	return p.FilterLine(func(line string) string {
 		return re.ReplaceAllString(line, replace)
 	})
+}
+
+// Read reads up to len(b) bytes from the pipe into b. It returns the number of
+// bytes read and any error encountered. At end of file, or on a nil pipe, Read
+// returns 0, [io.EOF].
+func (p *Pipe) Read(b []byte) (int, error) {
+	if p.Error() != nil {
+		return 0, p.Error()
+	}
+	return p.Reader.Read(b)
 }
 
 // SetError sets the error err on the pipe.
@@ -760,36 +859,19 @@ func (p *Pipe) SetError(err error) {
 
 // SHA256Sum returns the hex-encoded SHA-256 hash of the entire contents of the
 // pipe, or an error.
+// Deprecated: SHA256Sum has been deprecated by [Pipe.Hash]. To get the SHA-256
+// hash for the contents of the pipe, call `Hash(sha256.new())`
 func (p *Pipe) SHA256Sum() (string, error) {
-	if p.Error() != nil {
-		return "", p.Error()
-	}
-	hasher := sha256.New()
-	_, err := io.Copy(hasher, p)
-	if err != nil {
-		p.SetError(err)
-		return "", err
-	}
-	return hex.EncodeToString(hasher.Sum(nil)), p.Error()
+	return p.Hash(sha256.New())
 }
 
 // SHA256Sums reads paths from the pipe, one per line, and produces the
 // hex-encoded SHA-256 hash of each corresponding file, one per line. Any files
 // that cannot be opened or read will be ignored.
+// Deprecated: SHA256Sums has been deprecated by [Pipe.HashSums]. To get the SHA-256
+// hash for each file path in the pipe, call `HashSums(sha256.new())`
 func (p *Pipe) SHA256Sums() *Pipe {
-	return p.FilterScan(func(line string, w io.Writer) {
-		f, err := os.Open(line)
-		if err != nil {
-			return // skip unopenable files
-		}
-		defer f.Close()
-		h := sha256.New()
-		_, err = io.Copy(h, f)
-		if err != nil {
-			return // skip unreadable files
-		}
-		fmt.Fprintln(w, hex.EncodeToString(h.Sum(nil)))
-	})
+	return p.HashSums(sha256.New())
 }
 
 // Slice returns the pipe's contents as a slice of strings, one element per
@@ -804,6 +886,18 @@ func (p *Pipe) Slice() ([]string, error) {
 		result = append(result, line)
 	}).Wait()
 	return result, p.Error()
+}
+
+// stdErr returns the pipe's configured standard error writer for commands run
+// via [Pipe.Exec] and [Pipe.ExecForEach]. The default is nil, which means that
+// error output will go to the pipe.
+func (p *Pipe) stdErr() io.Writer {
+	if p.mu == nil { // uninitialised pipe
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.stderr
 }
 
 // Stdout copies the pipe's contents to its configured standard output (using
@@ -833,14 +927,36 @@ func (p *Pipe) String() (string, error) {
 	return string(data), p.Error()
 }
 
-// Wait reads the pipe to completion and discards the result. This is mostly
-// useful for waiting until concurrent filters have completed (see
-// [Pipe.Filter]).
-func (p *Pipe) Wait() {
+// Tee copies the pipe's contents to each of the supplied writers, like Unix
+// tee(1). If no writers are supplied, the default is the pipe's standard
+// output.
+func (p *Pipe) Tee(writers ...io.Writer) *Pipe {
+	teeWriter := p.stdout
+	if len(writers) > 0 {
+		teeWriter = io.MultiWriter(writers...)
+	}
+	return p.WithReader(io.TeeReader(p.Reader, teeWriter))
+}
+
+// Wait reads the pipe to completion and returns any error present on
+// the pipe, or nil otherwise. This is mostly useful for waiting until
+// concurrent filters have completed (see [Pipe.Filter]).
+func (p *Pipe) Wait() error {
 	_, err := io.Copy(io.Discard, p)
 	if err != nil {
 		p.SetError(err)
 	}
+	return p.Error()
+}
+
+// WithEnv sets the environment for subsequent [Pipe.Exec] and [Pipe.ExecForEach]
+// commands to the string slice env, using the same format as [os/exec.Cmd.Env].
+// An empty slice unsets all existing environment variables.
+func (p *Pipe) WithEnv(env []string) *Pipe {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.env = env
+	return p
 }
 
 // WithError sets the error err on the pipe.
@@ -868,6 +984,15 @@ func (p *Pipe) WithReader(r io.Reader) *Pipe {
 	return p
 }
 
+// WithStderr sets the standard error output for [Pipe.Exec] or
+// [Pipe.ExecForEach] commands to w, instead of the pipe.
+func (p *Pipe) WithStderr(w io.Writer) *Pipe {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stderr = w
+	return p
+}
+
 // WithStdout sets the pipe's standard output to the writer w, instead of the
 // default [os.Stdout].
 func (p *Pipe) WithStdout(w io.Writer) *Pipe {
@@ -885,7 +1010,7 @@ func (p *Pipe) writeOrAppendFile(path string, mode int) (int64, error) {
 	if p.Error() != nil {
 		return 0, p.Error()
 	}
-	out, err := os.OpenFile(path, mode, 0666)
+	out, err := os.OpenFile(path, mode, 0o666)
 	if err != nil {
 		p.SetError(err)
 		return 0, err
@@ -922,7 +1047,7 @@ func (ra ReadAutoCloser) Close() error {
 	if ra.r == nil {
 		return nil
 	}
-	return ra.r.(io.Closer).Close()
+	return ra.r.Close()
 }
 
 // Read reads up to len(b) bytes from ra's reader into b. It returns the number
@@ -937,4 +1062,10 @@ func (ra ReadAutoCloser) Read(b []byte) (n int, err error) {
 		ra.Close()
 	}
 	return n, err
+}
+
+func newScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 4096), math.MaxInt)
+	return scanner
 }

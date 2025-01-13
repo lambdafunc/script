@@ -3,14 +3,16 @@ package script_test
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"crypto/sha512"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -19,36 +21,27 @@ import (
 
 	"github.com/bitfield/script"
 	"github.com/google/go-cmp/cmp"
+	"github.com/rogpeppe/go-internal/testscript"
 )
 
 func TestMain(m *testing.M) {
-	switch os.Getenv("SCRIPT_TEST") {
-	case "args":
-		// Print out command-line arguments
-		script.Args().Stdout()
-	case "stdin":
-		// Echo input to output
-		script.Stdin().Stdout()
-	default:
-		os.Exit(m.Run())
-	}
+	os.Exit(testscript.RunMain(m, map[string]func() int{
+		"args": func() int {
+			script.Args().Stdout()
+			return 0
+		},
+		"echostdin": func() int {
+			script.Stdin().Stdout()
+			return 0
+		},
+	}))
 }
 
-func TestArgsSuppliesCommandLineArgumentsAsInputToPipeOnePerLine(t *testing.T) {
+func TestScript(t *testing.T) {
 	t.Parallel()
-	// dummy test to prove coverage
-	script.Args()
-	// now the real test
-	cmd := exec.Command(os.Args[0], "hello", "world")
-	cmd.Env = append(os.Environ(), "SCRIPT_TEST=args")
-	got, err := cmd.Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "hello\nworld\n"
-	if string(got) != want {
-		t.Errorf("want %q, got %q", want, string(got))
-	}
+	testscript.Run(t, testscript.Params{
+		Dir: "testdata/script",
+	})
 }
 
 func TestBasenameRemovesLeadingPathComponentsFromInputLines(t *testing.T) {
@@ -254,7 +247,7 @@ func TestDoPerformsSuppliedHTTPRequest(t *testing.T) {
 		fmt.Fprintln(w, "some data")
 	}))
 	defer ts.Close()
-	req, err := http.NewRequest(http.MethodGet, ts.URL, nil)
+	req, err := http.NewRequest(http.MethodGet, ts.URL, http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,17 +263,32 @@ func TestDoPerformsSuppliedHTTPRequest(t *testing.T) {
 
 func TestEachLine_FiltersInputThroughSuppliedFunction(t *testing.T) {
 	t.Parallel()
-	p := script.Echo("Hello\nGoodbye")
-	q := p.EachLine(func(line string, out *strings.Builder) {
-		out.WriteString(line + " world\n")
-	})
 	want := "Hello world\nGoodbye world\n"
-	got, err := q.String()
+	got, err := script.Echo("Hello\nGoodbye").
+		EachLine(func(line string, out *strings.Builder) {
+			out.WriteString(line + " world\n")
+		}).String()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got != want {
 		t.Errorf("want %q, got %q", want, got)
+	}
+}
+
+func TestEachLine_HandlesLongLines(t *testing.T) {
+	t.Parallel()
+	var got int
+	_, err := script.Echo(longLine).
+		EachLine(func(line string, out *strings.Builder) {
+			got++
+		}).String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := 2
+	if want != got {
+		t.Errorf("want %d lines counted, got %d", want, got)
 	}
 }
 
@@ -325,6 +333,36 @@ func TestExecForEach_ErrorsOnUnbalancedQuotes(t *testing.T) {
 	p.Wait()
 	if p.Error() == nil {
 		t.Error("want error with unbalanced quotes in command line")
+	}
+}
+
+func TestExecForEach_SendsStderrOutputToPipeStderr(t *testing.T) {
+	t.Parallel()
+	buf := new(bytes.Buffer)
+	out, err := script.Echo("go").WithStderr(buf).ExecForEach("{{.}}").String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "" {
+		t.Fatalf("unexpected output: %q", out)
+	}
+	if !strings.Contains(buf.String(), "Usage") {
+		t.Errorf("want stderr output containing the word 'Usage', got %q", buf.String())
+	}
+}
+
+func TestExecSendsStderrOutputToPipeStderr(t *testing.T) {
+	t.Parallel()
+	buf := new(bytes.Buffer)
+	out, err := script.NewPipe().WithStderr(buf).Exec("go").String()
+	if err == nil {
+		t.Fatal("want error when command returns a non-zero exit status")
+	}
+	if out != "" {
+		t.Fatalf("unexpected output: %q", out)
+	}
+	if !strings.Contains(buf.String(), "Usage") {
+		t.Errorf("want stderr output containing the word 'Usage', got %q", buf.String())
 	}
 }
 
@@ -399,7 +437,7 @@ func TestFilterReadsNoMoreThanRequested(t *testing.T) {
 		t.Fatal(err)
 	}
 	if want != got {
-		t.Error(cmp.Diff(want, got))
+		t.Fatal(cmp.Diff(want, got))
 	}
 	wantRemaining := "secondline"
 	if wantRemaining != source.String() {
@@ -455,11 +493,29 @@ func TestFilterScan_FiltersInputLineByLine(t *testing.T) {
 	t.Parallel()
 	input := "hello\nworld\ngoodbye"
 	want := "world\n"
-	got, err := script.Echo(input).FilterScan(func(line string, w io.Writer) {
-		if strings.HasPrefix(line, "w") {
-			fmt.Fprintln(w, line)
-		}
-	}).String()
+	got, err := script.Echo(input).
+		FilterScan(func(line string, w io.Writer) {
+			if strings.HasPrefix(line, "w") {
+				fmt.Fprintln(w, line)
+			}
+		}).String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want != got {
+		t.Error(cmp.Diff(want, got))
+	}
+}
+
+func TestFilterScan_HandlesLongLines(t *testing.T) {
+	t.Parallel()
+	want := "last line\n"
+	got, err := script.Echo(longLine).
+		FilterScan(func(line string, w io.Writer) {
+			if strings.HasPrefix(line, "last") {
+				fmt.Fprintln(w, line)
+			}
+		}).String()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -520,6 +576,38 @@ func TestFirstHasNoEffectGivenLessThanNInputLines(t *testing.T) {
 	}
 }
 
+func TestFirstDoesNotConsumeUnnecessaryData(t *testing.T) {
+	t.Parallel()
+	// First uses a 4096-byte buffer, so will always read at least
+	// that much, but no more (once N lines have been read).
+	r := strings.NewReader(strings.Repeat("line\n", 1000))
+	got, err := script.NewPipe().WithReader(r).First(1).String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "line\n"
+	if want != got {
+		t.Errorf("want output %q, got %q", want, got)
+	}
+	if r.Len() == 0 {
+		t.Errorf("no data left in reader")
+	}
+}
+
+func TestFreqHandlesLongLines(t *testing.T) {
+	t.Parallel()
+	got, err := script.Echo(longLine).Freq().Slice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 results, got %d: %q", len(got), got)
+	}
+	if got[0] != "1 last line" {
+		t.Fatalf("wrong result: %q", got)
+	}
+}
+
 func TestFreqProducesCorrectFrequencyTableForInput(t *testing.T) {
 	t.Parallel()
 	input := strings.Join([]string{
@@ -557,7 +645,7 @@ func TestGetMakesHTTPGetRequestToGivenURL(t *testing.T) {
 	t.Parallel()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			t.Errorf("want HTTP method GET, got %q", r.Method)
+			t.Fatalf("want HTTP method GET, got %q", r.Method)
 		}
 		fmt.Fprintln(w, "some data")
 	}))
@@ -610,13 +698,25 @@ func TestGetUsesPipeContentsAsRequestBody(t *testing.T) {
 			t.Fatal("reading request body", err)
 		}
 		if !cmp.Equal(want, got) {
-			t.Error(cmp.Diff(want, string(got)))
+			t.Fatalf(cmp.Diff(want, string(got)))
 		}
 	}))
 	defer ts.Close()
 	_, err := script.Echo("request data").Get(ts.URL).String()
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestJoinHandlesLongLines(t *testing.T) {
+	t.Parallel()
+	result, err := script.Echo(longLine).Join().String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := len(longLine)
+	if want != len(result) {
+		t.Errorf("want result length %d, got %d", want, len(result))
 	}
 }
 
@@ -718,6 +818,18 @@ func TestLastDropsAllButLastNLinesOfInput(t *testing.T) {
 	input := "a\nb\nc\n"
 	want := "b\nc\n"
 	got, err := script.Echo(input).Last(2).String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want != got {
+		t.Error(cmp.Diff(want, got))
+	}
+}
+
+func TestLastHandlesLongLines(t *testing.T) {
+	t.Parallel()
+	want := "last line\n"
+	got, err := script.Echo(longLine).Last(1).String()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -962,7 +1074,7 @@ func TestPostPostsToGivenURLUsingPipeAsRequestBody(t *testing.T) {
 			t.Fatal("reading request body", err)
 		}
 		if !cmp.Equal(want, got) {
-			t.Error(cmp.Diff(want, string(got)))
+			t.Fatal(cmp.Diff(want, string(got)))
 		}
 		fmt.Fprintln(w, "response data")
 	}))
@@ -1018,7 +1130,7 @@ func TestSHA256Sums_OutputsCorrectHashForEachSpecifiedFile(t *testing.T) {
 		want         string
 	}{
 		// To get the checksum run: openssl dgst -sha256 <file_name>
-		{"testdata/sha256Sum.input.txt", "1870478d23b0b4db37735d917f4f0ff9393dd3e52d8b0efa852ab85536ddad8e\n"},
+		{"testdata/hashSum.input.txt", "1870478d23b0b4db37735d917f4f0ff9393dd3e52d8b0efa852ab85536ddad8e\n"},
 		{"testdata/hello.txt", "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9\n"},
 		{"testdata/multiple_files", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"},
 	}
@@ -1030,6 +1142,39 @@ func TestSHA256Sums_OutputsCorrectHashForEachSpecifiedFile(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("%q: want %q, got %q", tc.testFileName, tc.want, got)
 		}
+	}
+}
+
+func TestTeeUsesConfiguredStdoutAsDefault(t *testing.T) {
+	t.Parallel()
+	buf := new(bytes.Buffer)
+	_, err := script.Echo("hello").WithStdout(buf).Tee().String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "hello"
+	got := buf.String()
+	if got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+}
+
+func TestTeeWritesDataToSuppliedWritersAsWellAsToPipe(t *testing.T) {
+	t.Parallel()
+	buf1, buf2 := new(bytes.Buffer), new(bytes.Buffer)
+	got, err := script.Echo("hello world").Tee(buf1, buf2).String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "hello world"
+	if want != got {
+		t.Errorf("want %q on pipe, got %q", want, got)
+	}
+	if want != buf1.String() {
+		t.Errorf("want %q on writer 1, got %q", want, buf1.String())
+	}
+	if want != buf2.String() {
+		t.Errorf("want %q on writer 2, got %q", want, buf2.String())
 	}
 }
 
@@ -1050,10 +1195,10 @@ func TestExecRunsGoWithNoArgsAndGetsUsageMessagePlusErrorExitStatus2(t *testing.
 	p := script.Exec("go")
 	output, err := p.String()
 	if err == nil {
-		t.Error("want error when command returns a non-zero exit status")
+		t.Fatal("want error when command returns a non-zero exit status")
 	}
 	if !strings.Contains(output, "Usage") {
-		t.Errorf("want output containing the word 'usage', got %q", output)
+		t.Fatalf("want output containing the word 'Usage', got %q", output)
 	}
 	want := 2
 	got := p.ExitStatus()
@@ -1073,7 +1218,7 @@ func TestExecRunsGoHelpAndGetsUsageMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(output, "Usage") {
-		t.Fatalf("want output containing the word 'usage', got %q", output)
+		t.Fatalf("want output containing the word 'Usage', got %q", output)
 	}
 }
 
@@ -1222,7 +1367,7 @@ func TestReadAutoCloser_ReadsAllDataFromSourceAndClosesItAutomatically(t *testin
 		t.Fatal(err)
 	}
 	if !cmp.Equal(want, got) {
-		t.Error(cmp.Diff(want, got))
+		t.Fatal(cmp.Diff(want, got))
 	}
 	_, err = io.ReadAll(acr)
 	if err == nil {
@@ -1242,21 +1387,15 @@ func TestSliceProducesElementsOfSpecifiedSliceOnePerLine(t *testing.T) {
 	}
 }
 
-func TestStdinReadsFromProgramStandardInput(t *testing.T) {
+func TestSliceGivenEmptySliceProducesEmptyPipe(t *testing.T) {
 	t.Parallel()
-	// dummy test to prove coverage
-	script.Stdin()
-	// now the real test
-	want := "hello world"
-	cmd := exec.Command(os.Args[0])
-	cmd.Env = append(os.Environ(), "SCRIPT_TEST=stdin")
-	cmd.Stdin = script.Echo(want)
-	got, err := cmd.Output()
+	want := ""
+	got, err := script.Slice([]string{}).String()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != want {
-		t.Errorf("want %q, got %q", want, string(got))
+	if want != got {
+		t.Fatalf("want %q, got %q", want, got)
 	}
 }
 
@@ -1272,7 +1411,7 @@ func TestStdoutReturnsErrorGivenReadErrorOnPipe(t *testing.T) {
 
 func TestStdoutSendsPipeContentsToConfiguredStandardOutput(t *testing.T) {
 	t.Parallel()
-	buf := &bytes.Buffer{}
+	buf := new(bytes.Buffer)
 	want := "hello world"
 	p := script.File("testdata/hello.txt").WithStdout(buf)
 	wrote, err := p.Stdout()
@@ -1280,11 +1419,11 @@ func TestStdoutSendsPipeContentsToConfiguredStandardOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	if wrote != len(want) {
-		t.Errorf("want %d bytes written, got %d", len(want), wrote)
+		t.Fatalf("want %d bytes written, got %d", len(want), wrote)
 	}
 	got := buf.String()
 	if want != got {
-		t.Errorf("want %q, got %q", want, string(got))
+		t.Fatalf("want %q, got %q", want, string(got))
 	}
 	_, err = p.String()
 	if err == nil {
@@ -1306,7 +1445,7 @@ func TestAppendFile_AppendsAllItsInputToSpecifiedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if int(wrote) != len(extra) {
-		t.Errorf("want %d bytes written, got %d", len(extra), int(wrote))
+		t.Fatalf("want %d bytes written, got %d", len(extra), int(wrote))
 	}
 	// check file contains both contents
 	got, err := script.File(path).String()
@@ -1527,7 +1666,7 @@ func TestWriteFile_WritesInputToFileCreatingItIfNecessary(t *testing.T) {
 		t.Fatal(err)
 	}
 	if int(wrote) != len(want) {
-		t.Errorf("want %d bytes written, got %d", len(want), int(wrote))
+		t.Fatalf("want %d bytes written, got %d", len(want), int(wrote))
 	}
 	got, err := script.File(path).String()
 	if err != nil {
@@ -1563,7 +1702,7 @@ func TestWriteFile_TruncatesExistingFile(t *testing.T) {
 	path := t.TempDir() + "/" + t.Name()
 	// write some data first so we can check for truncation
 	data := make([]byte, 15)
-	err := os.WriteFile(path, data, 0600)
+	err := os.WriteFile(path, data, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1572,14 +1711,14 @@ func TestWriteFile_TruncatesExistingFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if int(wrote) != len(want) {
-		t.Errorf("want %d bytes written, got %d", len(want), int(wrote))
+		t.Fatalf("want %d bytes written, got %d", len(want), int(wrote))
 	}
 	got, err := script.File(path).String()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got == want+"\x00\x00\x00" {
-		t.Errorf("file not truncated on write")
+		t.Fatalf("file not truncated on write")
 	}
 	if got != want {
 		t.Errorf("want %q, got %q", want, got)
@@ -1592,7 +1731,7 @@ func TestWithHTTPClient_SetsSuppliedClientOnPipe(t *testing.T) {
 		fmt.Fprintln(w, "some data")
 	}))
 	defer ts.Close()
-	req, err := http.NewRequest(http.MethodGet, ts.URL, nil)
+	req, err := http.NewRequest(http.MethodGet, ts.URL, http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1632,13 +1771,47 @@ func TestWithError_SetsSpecifiedErrorOnPipe(t *testing.T) {
 
 func TestWithStdout_SetsSpecifiedWriterAsStdout(t *testing.T) {
 	t.Parallel()
-	buf := &bytes.Buffer{}
+	buf := new(bytes.Buffer)
 	want := "Hello, world."
 	_, err := script.Echo(want).WithStdout(buf).Stdout()
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := buf.String()
+	if got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+}
+
+func TestWithEnv_UnsetsAllEnvVarsGivenEmptySlice(t *testing.T) {
+	t.Parallel()
+	p := script.NewPipe().WithEnv([]string{"ENV1=test1"}).Exec("sh -c 'echo ENV1=$ENV1'")
+	want := "ENV1=test1\n"
+	got, err := p.String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("want %q, got %q", want, got)
+	}
+	got, err = p.Echo("").WithEnv([]string{}).Exec("sh -c 'echo ENV1=$ENV1'").String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = "ENV1=\n"
+	if got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+}
+
+func TestWithEnv_SetsGivenVariablesForSubsequentExec(t *testing.T) {
+	t.Parallel()
+	env := []string{"ENV1=test1", "ENV2=test2"}
+	got, err := script.NewPipe().WithEnv(env).Exec("sh -c 'echo ENV1=$ENV1 ENV2=$ENV2'").String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "ENV1=test1 ENV2=test2\n"
 	if got != want {
 		t.Errorf("want %q, got %q", want, got)
 	}
@@ -1678,7 +1851,7 @@ func TestExitStatus_CorrectlyParsesExitStatusValueFromErrorMessage(t *testing.T)
 	}
 	for _, tc := range tcs {
 		p := script.NewPipe()
-		p.SetError(fmt.Errorf(tc.input))
+		p.SetError(errors.New(tc.input))
 		got := p.ExitStatus()
 		if got != tc.want {
 			t.Errorf("input %q: want %d, got %d", tc.input, tc.want, got)
@@ -1709,7 +1882,7 @@ func TestReadReturnsEOFOnUninitialisedPipe(t *testing.T) {
 	buf := []byte{0} // try to read at least 1 byte
 	n, err := p.Read(buf)
 	if !errors.Is(err, io.EOF) {
-		t.Errorf("want EOF, got %v", err)
+		t.Fatalf("want io.EOF, got %v", err)
 	}
 	if n > 0 {
 		t.Errorf("unexpectedly read %d bytes", n)
@@ -1726,6 +1899,239 @@ func TestReadReturnsErrorGivenReadErrorOnPipe(t *testing.T) {
 	}
 }
 
+func TestWait_ReturnsErrorPresentOnPipe(t *testing.T) {
+	t.Parallel()
+	p := script.Echo("a\nb\nc\n").ExecForEach("{{invalid template syntax}}")
+	if p.Wait() == nil {
+		t.Error("want error, got nil")
+	}
+}
+
+func TestWait_DoesNotReturnErrorForValidExecution(t *testing.T) {
+	t.Parallel()
+	p := script.Echo("a\nb\nc\n").ExecForEach("echo \"{{.}}\"")
+	if err := p.Wait(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+var base64Cases = []struct {
+	name    string
+	decoded string
+	encoded string
+}{
+	{
+		name:    "empty string",
+		decoded: "",
+		encoded: "",
+	},
+	{
+		name:    "single line string",
+		decoded: "hello world",
+		encoded: "aGVsbG8gd29ybGQ=",
+	},
+	{
+		name:    "multi line string",
+		decoded: "hello\nthere\nworld\n",
+		encoded: "aGVsbG8KdGhlcmUKd29ybGQK",
+	},
+}
+
+func TestEncodeBase64_CorrectlyEncodes(t *testing.T) {
+	t.Parallel()
+	for _, tc := range base64Cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := script.Echo(tc.decoded).EncodeBase64().String()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.encoded {
+				t.Logf("input %q incorrectly encoded:", tc.decoded)
+				t.Error(cmp.Diff(tc.encoded, got))
+			}
+		})
+	}
+}
+
+func TestDecodeBase64_CorrectlyDecodes(t *testing.T) {
+	t.Parallel()
+	for _, tc := range base64Cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := script.Echo(tc.encoded).DecodeBase64().String()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.decoded {
+				t.Logf("input %q incorrectly decoded:", tc.encoded)
+				t.Error(cmp.Diff(tc.decoded, got))
+			}
+		})
+	}
+}
+
+func TestEncodeBase64_FollowedByDecodeRecoversOriginal(t *testing.T) {
+	t.Parallel()
+	for _, tc := range base64Cases {
+		t.Run(tc.name, func(t *testing.T) {
+			decoded, err := script.Echo(tc.decoded).EncodeBase64().DecodeBase64().String()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decoded != tc.decoded {
+				t.Error("encode-decode round trip failed:", cmp.Diff(tc.decoded, decoded))
+			}
+			encoded, err := script.Echo(tc.encoded).DecodeBase64().EncodeBase64().String()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if encoded != tc.encoded {
+				t.Error("decode-encode round trip failed:", cmp.Diff(tc.encoded, encoded))
+			}
+		})
+	}
+}
+
+func TestDecodeBase64_CorrectlyDecodesInputToBytes(t *testing.T) {
+	t.Parallel()
+	input := "CAAAEA=="
+	got, err := script.Echo(input).DecodeBase64().Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{8, 0, 0, 16}
+	if !bytes.Equal(want, got) {
+		t.Logf("input %#v incorrectly decoded:", input)
+		t.Error(cmp.Diff(want, got))
+	}
+}
+
+func TestEncodeBase64_CorrectlyEncodesInputBytes(t *testing.T) {
+	t.Parallel()
+	input := []byte{8, 0, 0, 16}
+	reader := bytes.NewReader(input)
+	want := "CAAAEA=="
+	got, err := script.NewPipe().WithReader(reader).EncodeBase64().String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Logf("input %#v incorrectly encoded:", input)
+		t.Error(cmp.Diff(want, got))
+	}
+}
+
+func TestWithStdErr_IsConcurrencySafeAfterExec(t *testing.T) {
+	t.Parallel()
+	err := script.Exec("echo").WithStderr(nil).Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHash_OutputsCorrectHash(t *testing.T) {
+	t.Parallel()
+	tcs := []struct {
+		name, input, want string
+		hasher            hash.Hash
+	}{
+		{
+			name:   "for no data",
+			input:  "",
+			hasher: sha256.New(),
+			want:   "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		},
+		{
+			name:   "for short string with SHA 256 hasher",
+			input:  "hello, world",
+			hasher: sha256.New(),
+			want:   "09ca7e4eaa6e8ae9c7d261167129184883644d07dfba7cbfbc4c8a2e08360d5b",
+		},
+		{
+			name:   "for short string with SHA 512 hasher",
+			input:  "hello, world",
+			hasher: sha512.New(),
+			want:   "8710339dcb6814d0d9d2290ef422285c9322b7163951f9a0ca8f883d3305286f44139aa374848e4174f5aada663027e4548637b6d19894aec4fb6c46a139fbf9",
+		},
+		{
+			name:   "for string containing newline with SHA 256 hasher",
+			input:  "The tao that can be told\nis not the eternal Tao",
+			hasher: sha256.New(),
+			want:   "788542cb92d37f67e187992bdb402fdfb68228a1802947f74c6576e04790a688",
+		},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := script.Echo(tc.input).Hash(tc.hasher)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Errorf("want %q, got %q", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestHashSums_OutputsCorrectHashForEachSpecifiedFile(t *testing.T) {
+	t.Parallel()
+	tcs := []struct {
+		testFileName string
+		hasher       hash.Hash
+		want         string
+	}{
+		// To get the checksum run: openssl dgst -sha256 <file_name>
+		{
+			testFileName: "testdata/hashSum.input.txt",
+			hasher:       sha256.New(),
+			want:         "1870478d23b0b4db37735d917f4f0ff9393dd3e52d8b0efa852ab85536ddad8e\n",
+		},
+		{
+			testFileName: "testdata/hashSum.input.txt",
+			hasher:       sha512.New(),
+			want:         "3543bd0d68129e860598ccabcee1beb6bb90d91105cea74a8e555588634ec6f6d6d02033139972da2dc4929b1fb61bd24c91c8e82054e9ae865cf7f70909be8c\n",
+		},
+		{
+			testFileName: "testdata/hello.txt",
+			hasher:       sha256.New(),
+			want:         "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9\n",
+		},
+		{
+			testFileName: "testdata/multiple_files",
+			hasher:       sha256.New(),
+			want:         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
+		},
+	}
+	for _, tc := range tcs {
+		got, err := script.ListFiles(tc.testFileName).HashSums(tc.hasher).String()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != tc.want {
+			t.Errorf("%q: want %q, got %q", tc.testFileName, tc.want, got)
+		}
+	}
+}
+
+func TestHash_ReturnsErrorGivenReadErrorOnPipe(t *testing.T) {
+	t.Parallel()
+	brokenReader := iotest.ErrReader(errors.New("oh no"))
+	_, err := script.NewPipe().WithReader(brokenReader).Hash(sha256.New())
+	if err == nil {
+		t.Fatal(nil)
+	}
+}
+
+func TestHashSums_OutputsEmptyStringForFileThatCannotBeHashed(t *testing.T) {
+	got, err := script.Echo("file_does_not_exist.txt").HashSums(sha256.New()).String()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ""
+	if got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+}
+
 func ExampleArgs() {
 	script.Args().Stdout()
 	// prints command-line arguments
@@ -1736,9 +2142,10 @@ func ExampleDo() {
 		fmt.Fprintln(w, "some data")
 	}))
 	defer ts.Close()
-	req, err := http.NewRequest(http.MethodGet, ts.URL, nil)
+	req, err := http.NewRequest(http.MethodGet, ts.URL, http.NoBody)
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
+		return
 	}
 	script.Do(req).Stdout()
 	// Output:
@@ -1844,6 +2251,12 @@ func ExamplePipe_CountLines() {
 	// 3
 }
 
+func ExamplePipe_DecodeBase64() {
+	script.Echo("SGVsbG8sIHdvcmxkIQ==").DecodeBase64().Stdout()
+	// Output:
+	// Hello, world!
+}
+
 func ExamplePipe_Do() {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		data, err := io.ReadAll(r.Body)
@@ -1855,7 +2268,8 @@ func ExamplePipe_Do() {
 	defer ts.Close()
 	req, err := http.NewRequest(http.MethodGet, ts.URL, strings.NewReader("hello"))
 	if err != nil {
-		log.Fatal(err)
+		log.Println(err)
+		return
 	}
 	script.NewPipe().Do(req).Stdout()
 	// Output:
@@ -1876,6 +2290,12 @@ func ExamplePipe_Echo() {
 	script.NewPipe().Echo("Hello, world!").Stdout()
 	// Output:
 	// Hello, world!
+}
+
+func ExamplePipe_EncodeBase64() {
+	script.Echo("Hello, world!").EncodeBase64().Stdout()
+	// Output:
+	// SGVsbG8sIHdvcmxkIQ==
 }
 
 func ExamplePipe_ExitStatus() {
@@ -1973,6 +2393,24 @@ func ExamplePipe_Get() {
 	script.Echo("hello").Get(ts.URL).Stdout()
 	// Output:
 	// You said: hello
+}
+
+func ExamplePipe_Hash() {
+	sum, err := script.Echo("hello world").Hash(sha512.New())
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(sum)
+	// Output:
+	// 309ecc489c12d6eb4cc40f50c902f2b4d0ed77ee511a7c7a9bcd3ca86d4cd86f989dd35bc5ff499670da34255b45b0cfd830e81f605dcf7dc5542e93ae9cd76f
+}
+
+func ExamplePipe_HashSums() {
+	script.ListFiles("testdata/multiple_files").HashSums(sha256.New()).Stdout()
+	// Output:
+	// e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+	// e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+	// e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 }
 
 func ExamplePipe_Join() {
@@ -2115,6 +2553,40 @@ func ExamplePipe_String() {
 	// world
 }
 
+func ExamplePipe_Tee_stdout() {
+	s, err := script.Echo("hello\n").Tee().String()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(s)
+	// Output:
+	// hello
+	// hello
+}
+
+func ExamplePipe_Tee_writers() {
+	buf1, buf2 := new(bytes.Buffer), new(bytes.Buffer)
+	s, err := script.Echo("hello\n").Tee(buf1, buf2).String()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Print(s)
+	fmt.Print(buf1.String())
+	fmt.Print(buf2.String())
+	// Output:
+	// hello
+	// hello
+	// hello
+}
+
+func ExamplePipe_WithStderr() {
+	buf := new(bytes.Buffer)
+	script.NewPipe().WithStderr(buf).Exec("go").Wait()
+	fmt.Println(strings.Contains(buf.String(), "Usage"))
+	// Output:
+	// true
+}
+
 func ExampleSlice() {
 	input := []string{"1", "2", "3"}
 	script.Slice(input).Stdout()
@@ -2123,3 +2595,8 @@ func ExampleSlice() {
 	// 2
 	// 3
 }
+
+// A string containing a line longer than bufio.MaxScanTokenSize, for testing
+// methods that buffer input. We want to make sure they don't throw
+// "bufio.Scanner: token too long" errors.
+var longLine = strings.Repeat("super long line ", 4096) + "\nlast line\n"
